@@ -254,6 +254,8 @@ class Inferencer:
                 else:
                     history_action_state = None
 
+                breakpoint()
+
                 preds = pipe.infer(
                     image=image,
                     prompt=prompt[:batch_size],
@@ -283,9 +285,15 @@ class Inferencer:
                     
                     video = preds['video'].data.cpu()
 
-                    save_video(rearrange(gt_video[0].data.cpu(), 'c v t h w -> c t h (v w)', v=n_view), os.path.join(model_save_dir, f'{save_cap}_gt.mp4'), fps=(self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1)
+                    fps = (self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1
 
-                    save_video(rearrange(video, '(b v) c t h w -> b c t h (v w)', v=n_view)[0], os.path.join(model_save_dir, f'{save_cap}.mp4'), fps=(self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1)
+                    gt_video_grid = rearrange(gt_video[0].data.cpu(), 'c v t h w -> c t h (v w)', v=n_view)
+                    rollout_video_grid = rearrange(video, '(b v) c t h w -> b c t h (v w)', v=n_view)[0]
+
+                    # 同时输出单独文件与上下堆叠的对比视频，便于检视
+                    save_video(gt_video_grid, os.path.join(model_save_dir, f'{save_cap}_gt.mp4'), fps=fps)
+                    save_video(rollout_video_grid, os.path.join(model_save_dir, f'{save_cap}.mp4'), fps=fps)
+                    save_video(torch.cat((gt_video_grid, rollout_video_grid), dim=2), os.path.join(model_save_dir, f'{save_cap}_compare.mp4'), fps=fps)
 
 
                 if self.args.return_action:

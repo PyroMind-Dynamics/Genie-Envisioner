@@ -1,3 +1,10 @@
+"""
+GE-Act / GE-Sim 训练器：
+- 负责读取配置、构建数据集、加载 tokenizer/VAE/Transformer/Scheduler、组装 pipeline
+- 支持 DeepSpeed/Accelerate 分布式与混精训练
+- 提供 train/validate 流程与定期保存 ckpt、日志记录
+"""
+
 import os, random, math
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -58,6 +65,12 @@ from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_co
 # ----------------------------------------------------
 from utils.extra_utils import act_metric
 
+# ----------------------------------------------------
+# GE-Sim 条件：轨迹(traj)与射线(ray)拼接到 Cosmos Transformer 输入通道
+from utils.get_traj_maps import get_traj_maps, simple_radius_gen_func
+from utils.get_ray_maps import get_ray_maps
+from utils.geometry_utils import resize_traj_and_ray
+
 LOG_LEVEL = "INFO"
 # LOG_LEVEL = "DEBUG"
 logger = get_logger("wm_runner")
@@ -65,6 +78,7 @@ logger.setLevel(LOG_LEVEL)
 
 
 class State:
+    """保存训练过程中的公共状态与元信息。"""
     # Training state
     seed: int = None
     model_name: str = None
@@ -86,8 +100,9 @@ class State:
 
 
 class Trainer:
-
+    """通用训练入口，兼容 video/action/all 模式，支持分布式与断点保存。"""
     def __init__(self, config_file, to_log=True, output_dir=None) -> None:
+        """读取 YAML 配置，初始化分布式、日志、输出目录等。"""
         
         cd = load(open(config_file, "r"), Loader=Loader)
         args = argparse.Namespace(**cd)
@@ -229,6 +244,7 @@ class Trainer:
 
 
     def prepare_dataset(self) -> None:
+        """构建训练/验证数据集与 DataLoader。"""
 
         logger.info(f"Training Dataset: {self.args.train_data_class}")
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -253,6 +269,7 @@ class Trainer:
 
 
     def prepare_val_dataset(self) -> None:
+        """构建验证集子集，保存抽样的验证索引用于固定评测。"""
         if not hasattr(self.args, "val_data_class"):
             self.args.val_data_class = self.args.train_data_class
         logger.info(f"Validation Dataset: {self.args.val_data_class}")
@@ -277,6 +294,7 @@ class Trainer:
 
 
     def prepare_models(self):
+        """加载 tokenizer、文本编码器、VAE、Transformer、Scheduler，并记录尺度参数。"""
 
         logger.info("Initializing models")
         device = self.state.accelerator.device
@@ -353,6 +371,7 @@ class Trainer:
 
 
     def prepare_trainable_parameters(self):
+        """设置可训练参数、梯度检查点、TF32 开关等。"""
         logger.info("Initializing trainable parameters")
         
         components_to_disable_grads = []
@@ -376,6 +395,7 @@ class Trainer:
 
 
     def prepare_optimizer(self):
+        """根据 train_mode 筛选可训练参数，初始化优化器与 LR 调度。"""
         logger.info("Initializing optimizer and lr scheduler")
 
         train_mode = self.args.train_mode
@@ -460,18 +480,21 @@ class Trainer:
         
 
     def prepare_for_training(self):
+        """通过 Accelerator 封装模型/优化器/数据加载器，准备分布式训练。"""
         self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler = self.state.accelerator.prepare(
             self.diffusion_model, self.optimizer, self.train_dataloader, self.lr_scheduler
         )
 
 
     def prepare_trackers(self):
+        """初始化追踪器（如 TensorBoard、W&B）。"""
         logger.info("Initializing trackers")
         tracker_name = self.args.tracker_name or "model_train"
         self.state.accelerator.init_trackers(tracker_name, config=self.args.__dict__)
 
 
     def train(self):
+        """主训练循环：前向、损失、反传、日志、验证与保存 ckpt。"""
         logger.info("Starting training")
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory before training start: {json.dumps(memory_statistics, indent=4)}")
@@ -639,6 +662,89 @@ class Trainer:
 
                     noisy_latents = (1.0 - ss) * latents + ss * noise
 
+                    # -----------------------------
+                    # GE-Sim（Cosmos2）条件通道：traj + ray
+                    # 目标：让输入通道满足 config.in_channels（例如 26），并与预训练 ckpt 结构一致：
+                    #   base: 16 (vae latent)
+                    #   + 9 (traj 3 + ray 6)
+                    #   + 1 (condition_mask，在 transformer 内部拼接)
+                    #   + 1 (padding_mask，在 concat_padding_mask=True 时内部拼接)
+                    if getattr(self.args, "action_cond_mode", False):
+                        # 需要 dataset 提供：
+                        # - actions: (b, t_raw, 16)  -> xyz+quat+gripper per arm（eef_quat）
+                        # - intrinsics: (b, v, 3, 3)
+                        # - c2ws: (b, v, t_raw, 4, 4)
+                        pose_seq = batch.get("actions", None)
+                        intr_bv = batch.get("intrinsics", None)
+                        c2ws_bvt = batch.get("c2ws", None)
+
+                        if pose_seq is None or intr_bv is None or c2ws_bvt is None:
+                            raise RuntimeError(
+                                "action_cond_mode=True 但 batch 缺少 actions/intrinsics/c2ws。"
+                                "请确保使用 AgiBotWorld 并在 __getitem__ 返回这些字段。"
+                            )
+
+                        # t_raw：memory + future(raw) 的长度，应与视频帧数对齐
+                        # pose_seq: (b, t_raw, 16)
+                        # intr_bv: (b, v, 3, 3)
+                        # c2ws_bvt: (b, v, t_raw, 4, 4)
+                        cond_per_bv = []
+                        # 这里用 CPU 生成 traj 图（包含 cv2 绘制），再搬到 GPU；后续可优化/缓存
+                        pose_seq_cpu = pose_seq.detach().cpu()
+                        intr_cpu = intr_bv.detach().cpu()
+                        c2ws_cpu = c2ws_bvt.detach().cpu()
+                        for bi in range(pose_seq_cpu.shape[0]):
+                            pose_i = pose_seq_cpu[bi]  # (t_raw, 16)
+                            intrinsic_i = intr_cpu[bi]  # (v, 3, 3)
+                            c2w_i = c2ws_cpu[bi]  # (v, t_raw, 4, 4)
+                            w2c_i = torch.linalg.inv(c2w_i)
+
+                            # 为了避免在训练中生成巨大的 (H,W) 条件张量，这里直接在 latent 分辨率上生成 traj/ray，
+                            # 并对 intrinsic 做等比例缩放（相当于把成像平面下采样）。
+                            # trajs: (3, v, t_raw, latent_h, latent_w) in [0,1]
+                            intrinsic_low = intrinsic_i.clone()
+                            intrinsic_low[:, 0, 0] = intrinsic_low[:, 0, 0] * (latent_width / raw_width)
+                            intrinsic_low[:, 0, 2] = intrinsic_low[:, 0, 2] * (latent_width / raw_width)
+                            intrinsic_low[:, 1, 1] = intrinsic_low[:, 1, 1] * (latent_height / raw_height)
+                            intrinsic_low[:, 1, 2] = intrinsic_low[:, 1, 2] * (latent_height / raw_height)
+
+                            trajs = get_traj_maps(
+                                pose_i, w2c_i, c2w_i, intrinsic_low,
+                                sample_size=(latent_height, latent_width),
+                                radius_gen_func=simple_radius_gen_func
+                            )
+                            trajs = trajs * 2.0 - 1.0  # -> [-1, 1]
+
+                            # rays: (6, v, t_raw, latent_h, latent_w)
+                            v_ = c2w_i.shape[0]
+                            t_ = c2w_i.shape[1]
+                            intrinsic_vt = intrinsic_low.unsqueeze(1).repeat(1, t_, 1, 1).reshape(-1, 3, 3)
+                            c2w_vt = c2w_i.reshape(-1, 4, 4)
+                            rays_o, rays_d = get_ray_maps(intrinsic_vt, c2w_vt, latent_height, latent_width)  # (vt,H,W,3)
+                            rays = torch.cat((rays_o, rays_d), dim=-1)  # (vt,H,W,6)
+                            rays = rays.reshape(v_, t_, latent_height, latent_width, 6).permute(4, 0, 1, 2, 3).contiguous()
+
+                            cond_i = torch.cat((trajs, rays), dim=0)  # (9, v, t_raw, H, W)
+                            cond_i = cond_i.permute(1, 0, 2, 3, 4).contiguous()  # (v, 9, t_raw, H, W)
+                            cond_per_bv.append(cond_i)
+
+                        cond_per_bv = torch.cat(cond_per_bv, dim=0)  # (b*v, 9, t_raw, H, W)
+                        cond_per_bv = cond_per_bv.to(device=accelerator.device, dtype=weight_dtype)
+
+                        # resize 到 latent 空间：time -> (mem + future_lat), space -> (latent_h, latent_w)
+                        future_lat = latent_frames - mem_size
+                        cond_resized = resize_traj_and_ray(
+                            cond_per_bv,
+                            mem_size=mem_size,
+                            future_size=future_lat,
+                            height=latent_height,
+                            width=latent_width,
+                        )  # (b*v, 9, latent_frames, latent_h, latent_w)
+
+                        cond_flat = rearrange(cond_resized, "bv c t h w -> bv (t h w) c")
+                        # 与 noisy_latents 的 token 维对齐后，在 channel(last) 维拼接
+                        noisy_latents = torch.cat((noisy_latents, cond_flat.to(noisy_latents.dtype)), dim=-1)
+
                     # These weighting schemes use a uniform timestep sampling and instead post-weight the loss, shape bv,1,c
                     weights = compute_loss_weighting_for_sd3(
                         weighting_scheme=self.args.flow_weighting_scheme, sigmas=sigmas
@@ -778,6 +884,7 @@ class Trainer:
 
 
     def validate(self, accelerator, model_save_dir, global_step, n_view=1, n_chunk=30, image=None, prompt=None, cap=None, path=None, gt_actions=None, to_log=True):
+        """验证/可视化：生成视频与动作，对应保存到指定目录并可写日志。"""
 
         os.makedirs(model_save_dir,exist_ok=True)
 

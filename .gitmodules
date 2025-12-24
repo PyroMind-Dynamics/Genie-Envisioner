@@ -1,0 +1,3 @@
+[submodule "Genie-Envisioner"]
+	path = Genie-Envisioner
+	url = https://github.com/PyroMind-Dynamics/Genie-Envisioner.git

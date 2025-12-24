@@ -101,7 +101,8 @@ class AgiBotWorld(Dataset):
 
         assert(action_type in ["delta", "absolute", "relative"])
         self.action_type = action_type
-        assert(action_space in ["eef", "joint"])
+        # eef_quat: xyz+quat+gripper for each arm, used by GE-Sim traj-map conditioning
+        assert(action_space in ["eef", "joint", "eef_quat"])
         self.action_space = action_space
 
         self.random_crop = random_crop
@@ -138,6 +139,15 @@ class AgiBotWorld(Dataset):
 
                         for episode in episode_list:
                             episode_id = os.path.basename(episode)
+                            video_root = episode
+                            caminfo_root = os.path.join(_data_root, "parameters", task, episode_id)
+                            proprio_root = os.path.join(_data_root, "proprio_stats", task, episode_id, "proprio_stats.h5")
+
+                            # 若对应 episode 数据缺失，则跳过并提示
+                            if not (os.path.exists(video_root) and os.path.exists(caminfo_root) and os.path.exists(proprio_root)):
+                                zero_rank_print(f"[warning] skip episode {episode_id} (task {task}): missing data path.")
+                                continue
+
                             info = [
                                 episode,
                                 os.path.join(_data_root, "parameters", task, episode_id),
@@ -275,6 +285,13 @@ class AgiBotWorld(Dataset):
         """
         
         action, delta_action = parse_h5(h5_file, slices=slices, delta_act_sidx=0, action_space=self.action_space)
+
+        # GE-Sim traj conditioning 需要原始 xyz+quat+gripper，不做统计归一化
+        if self.action_space == "eef_quat":
+            action = torch.FloatTensor(action)
+            # 用 memory 的最后一帧作为 state（这里仅为接口兼容；GE-Sim video_only 训练通常不使用 state）
+            state = action[self.n_previous - 1 : self.n_previous].clone()
+            return action, state
 
         act_meanv, act_stdv = self.get_action_bias_std(domain_name)
         state = torch.FloatTensor(action[self.n_previous-1:self.n_previous])
@@ -497,5 +514,8 @@ class AgiBotWorld(Dataset):
             actions=actions,
             state=state,
             caption=caption,
+            # GE-Sim 条件训练所需：相机内参与每帧位姿（c2w）
+            intrinsics=intrinsics,
+            c2ws=extrinsics,
         )
         return sample

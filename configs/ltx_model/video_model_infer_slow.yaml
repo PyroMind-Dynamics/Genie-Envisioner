@@ -4,8 +4,8 @@ report_to: None
 tracker_name: ltx_trainer
 
 logging_dir: logs
-output_dir: PATH_TO_SAVE_LOGS_AND_CHECKPOINTS
-pretrained_model_name_or_path: PATH_TO_PRETRAINED_WEIGHTS_OF_VAE_AND_TOKENIZER
+output_dir: /workspace/Genie-Envisioner/outputs
+pretrained_model_name_or_path: /workspace/LTX-Video
 
 ###
 train_data_class_path: data/agibotworld_dataset.py
@@ -95,7 +95,7 @@ flow_mode_scale: 1.29
 pixel_wise_timestep: True
 
 diffusion_model:
-  model_path: PATH_TO_CHECKPOINT_SAFETENSOR
+  model_path: /workspace/Genie-Envisioner/Genie-Envisioner/GE_base_slow_v0.1.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
@@ -119,8 +119,8 @@ diffusion_model:
 
 data:
   train:
-    data_roots: ["path/to/agibot-world/beta"]
-    task_info_root: "root/to/agibot-world/beta/task_info"
+    data_roots: ["/workspace/AgiBotWorld-Alpha"]
+    task_info_root: "/workspace/AgiBotWorld-Alpha/task_info"
     domains: ["agibotworld", ]
     sample_size: [192, 256]
     sample_n_frames: 900
@@ -131,13 +131,13 @@ data:
     n_previous: 4
     previous_pick_mode: 'random'
     random_crop: True
-    dataset_info_cache_path: "path/to/save/dataset_meta_info_cache"
+    dataset_info_cache_path: "/workspace/Genie-Envisioner/outputs/save/train/dataset_meta_info_cache"
   val:
-    data_roots: ["path/to/agibot-world/beta"]
-    task_info_root: "root/to/agibot-world/beta/task_info"
+    data_roots: ["/workspace/AgiBotWorld-Alpha"]
+    task_info_root: "/workspace/AgiBotWorld-Alpha/task_info"
     domains: ["agibotworld", ]
     sample_size: [192, 256]
-    sample_n_frames: 900
+    sample_n_frames: 9000
     preprocess :  'resize'
     valid_cam :  ['head', 'hand_left', 'hand_right']
     chunk: 57
@@ -145,7 +145,7 @@ data:
     n_previous: 4
     previous_pick_mode: 'random'
     random_crop: False
-    dataset_info_cache_path: "path/to/save/dataset_meta_info_cache"
+    dataset_info_cache_path: "/workspace/Genie-Envisioner/outputs/save/val/dataset_meta_info_cache"
 
 use_color_jitter: true
 num_inference_step: 50

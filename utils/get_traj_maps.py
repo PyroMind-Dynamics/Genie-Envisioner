@@ -4,18 +4,17 @@ import matplotlib.cm as cm
 import torch
 from einops import rearrange
 
+# 说明：
+# 本文件提供将 3D 位姿/动作轨迹投影到多视角图像上的可视化工具。
+# 输入：双臂末端位姿（含平移+四元数）、相机内外参、图像尺寸。
+# 过程：将末端坐标转换到相机坐标系，投影到像素平面，绘制圆点和连线得到轨迹热力图。
+# 输出：形状 (c, v, t, h, w) 的轨迹图，c=3 通道，v 视角数，t 帧数。
+
 
 def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
     """
-    Convert rotations given as quaternions to rotation matrices.
-    Copied from https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/transforms/rotation_conversions.py#L43C1-L72C54
-
-    Args:
-        quaternions: quaternions with real part first,
-            as tensor of shape (..., 4).
-
-    Returns:
-        Rotation matrices as tensor of shape (..., 3, 3).
+    将四元数转换为旋转矩阵（实部在前），来自 pytorch3d 的实现。
+    输入形状 (..., 4)，输出同批次的 (..., 3, 3)。
     """
     r, i, j, k = torch.unbind(quaternions, -1)
     # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
@@ -38,7 +37,7 @@ def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
 
 
 def get_transformation_matrix_from_quat(quat):
-    ### quat: (b, 7)
+    # 将位置 (x,y,z) + 四元数组合的形状 (b,7) 转成 4x4 齐次变换矩阵
     rot_quat = quat[:, 3:]
     rot_quat = rot_quat[:, [3,0,1,2]]
     rot = quaternion_to_matrix(rot_quat)
@@ -50,13 +49,24 @@ def get_transformation_matrix_from_quat(quat):
 
 
 def simple_radius_gen_func(xyzs, c_xyzs):
-    ### A simple emperical function to generate raidus based on the distances between end-effectors and the camera
+    # 根据末端与相机距离生成圆点半径的经验函数，距离近 -> 半径大
     radius = torch.clamp(1.0 - torch.sqrt(((xyzs-c_xyzs)**2).sum(-1))-0.07/(0.8-0.07), min=0, max=1) * 100
     return radius
 
 
 def get_traj_maps(pose, w2c, c2w, intrinsic, sample_size, radius_gen_func=None):
-    
+    """
+    将双臂末端位姿序列投影到多视角图像，生成轨迹可视化图。
+    参数：
+        pose: 形状 (t, 16) 或 (t, >=16)，左/右臂各 7+1（平移+四元数+夹爪状态）。
+        w2c: 形状 (v, t, 4, 4)，世界到相机的变换矩阵。
+        c2w: 形状 (v, t, 4, 4)，相机到世界的变换矩阵。
+        intrinsic: 形状 (v, 3, 3)，相机内参。
+        sample_size: (h, w)，输出分辨率。
+        radius_gen_func: 可选函数，根据末端与相机距离生成绘制半径。
+    返回：
+        torch.Tensor，形状 (c, v, t, h, w)，值域约 [0,1]，可直接作为图像/视频通道。
+    """
     h, w = sample_size
     colormap_l = cm.Greens
     colormap_r = cm.Reds
@@ -74,11 +84,11 @@ def get_traj_maps(pose, w2c, c2w, intrinsic, sample_size, radius_gen_func=None):
     ], dtype=torch.float32, device=pose.device).view(1,1,4,4).permute(0,1,3,2)
 
 
-    ### 1, t, 4, 4
+    # 左右臂末端从 (t,7) 转 4x4 位姿矩阵，增加 batch 维 -> (1,t,4,4)
     pose_l_mat = get_transformation_matrix_from_quat(pose[:, 0:7]).unsqueeze(dim=0)
     pose_r_mat = get_transformation_matrix_from_quat(pose[:, 8:15]).unsqueeze(dim=0)
 
-    ### v, t, 4, 4
+    # 末端位姿从世界坐标系变换到相机坐标系
     ee2cam_l = torch.matmul(w2c, pose_l_mat)
     ee2cam_r = torch.matmul(w2c, pose_r_mat)
 
@@ -91,18 +101,17 @@ def get_traj_maps(pose, w2c, c2w, intrinsic, sample_size, radius_gen_func=None):
     ee2cam_l = torch.matmul(ee2cam_l, correct_matrix)
     ee2cam_r = torch.matmul(ee2cam_r, correct_matrix)
 
-    ### v, t, 4, 4
+    # 末端关键点（原点 + 三轴单位向量）变换到相机坐标系
     pts_l = torch.matmul(ee2cam_l, ee_key_pts)
     pts_r = torch.matmul(ee2cam_r, ee_key_pts)
     
-    ### v, 1, 3, 3
+    # 内参扩一维以便按时间广播
     intrinsic = intrinsic.unsqueeze(1)
 
-    ### v, t, 3, 4
+    # 投影到像素平面，得到像素坐标 (u,v)
     uvs_l0 = torch.matmul(intrinsic, pts_l[:,:,:3,:])
     uvs_l = (uvs_l0 / pts_l[:,:,2:3,:])[:,:,:2,:].permute(0,1,3,2).to(dtype=torch.int64)
 
-    ### v, t, 3, 4
     uvs_r0 = torch.matmul(intrinsic, pts_r[:,:,:3,:])
     uvs_r = (uvs_r0 / pts_r[:,:,2:3,:])[:,:,:2,:].permute(0,1,3,2).to(dtype=torch.int64)
 
@@ -124,6 +133,7 @@ def get_traj_maps(pose, w2c, c2w, intrinsic, sample_size, radius_gen_func=None):
         img_list = []
         for i in range(pose.shape[0]):
             
+            # 灰底图，逐帧绘制左右末端的圆点与连线
             img = np.zeros((h, w, 3), dtype=np.uint8) + 50
 
             normalized_value_l = pose[i, 7].item() / 120
@@ -161,6 +171,7 @@ def get_traj_maps(pose, w2c, c2w, intrinsic, sample_size, radius_gen_func=None):
         img_list = np.stack(img_list, axis=0) ### t,h,w,c
         all_img_list.append(img_list)
 
+    # 转成 (c, v, t, h, w) 方便后续拼接/存储
     all_img_list = np.stack(all_img_list, axis=0) ### ncam, t, h, w, c
     all_img_list = rearrange(torch.tensor(all_img_list), "v t h w c -> c v t h w").float()
 

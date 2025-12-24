@@ -1,8 +1,8 @@
-model_name: 'cosmos2_train'
+model_name: 'sana_2B_480p_train'
 is_i2v: True
 report_to: None
-tracker_name: cosmos2_trainer
-output_dir: outputs/cosmos2_train   # 训练产出目录（ckpt/日志）
+tracker_name: sana_2B_480p_trainer
+output_dir: outputs/sana_2B_480p_train   # 训练产出目录（ckpt/日志）
 
 logging_dir: logs
 
@@ -11,8 +11,8 @@ train_data_class: AgiBotWorld              # 训练集类名
 val_data_class_path: data/agibotworld_dataset.py  # 验证集类路径，若同训练集可复用
 val_data_class: AgiBotWorld          # 验证集类名，若同训练集可复用
 
-pretrained_model_name_or_path: /workspace/Cosmos-Predict2-2B-Video2World
-tokenizer_pretrained_model_name_or_path: /workspace/Cosmos-Predict2-2B-Video2World
+pretrained_model_name_or_path: /workspace/SANA-Video_2B_480p
+tokenizer_pretrained_model_name_or_path: /workspace/SANA-Video_2B_480p
 
 
 ### 
@@ -21,11 +21,11 @@ tokenizer_class: T5TokenizerFast
 textenc_class_path: transformers
 textenc_class: T5EncoderModel
 
-vae_class_path: models/cosmos_models/models/autoencoders/autoencoder_kl_wan.py
+vae_class_path: models/sana_models/autoencoder_kl_wan.py
 vae_class: AutoencoderKLWan
 
-diffusion_model_class_path: models/cosmos_models/models/transformers/transformer_cosmos_multiview.py
-diffusion_model_class: MultiViewCosmosTransformer3DModel
+diffusion_model_class_path: models/sana_models/transformer_sana.py
+diffusion_model_class: MultiViewSANATransformer3DModel
 
 diffusion_scheduler_class_path: models/pipeline/gesim_cosmos2_pipeline_utils/scheduling_flow_match_euler_discrete.py
 diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler 

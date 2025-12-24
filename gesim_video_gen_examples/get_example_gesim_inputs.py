@@ -150,16 +150,17 @@ def reorganize_gesim_inputs(data_root, task_id, episode_id, save_root, sidx=0, e
 
             np.save(os.path.join(save_root, f"extrinsic_{cam}.npy"), c2bs)
 
-
-    with open(os.path.join(episode_root, "parameters", "camera", f"{cam}_intrinsic_params.json")) as f:
-        intrinsic_info = json.load(f)["intrinsic"]
-        intrinsic = np.eye(3)
-        intrinsic[0,0] = intrinsic_info["fx"]
-        intrinsic[1,1] = intrinsic_info["fy"]
-        intrinsic[0,2] = intrinsic_info["ppx"]
-        intrinsic[1,2] = intrinsic_info["ppy"]
-    ### 3,3
-    np.save(os.path.join(save_root, f"intrinsic_{cam}.npy"), intrinsic)
+    # 这里需要增加这个循环，不然会导致生成的intrinsic文件缺少视角。 且这里的cam实际在使用时是未定义的。。。有非法访问的嫌疑
+    for cam in cams:
+        with open(os.path.join(episode_root, "parameters", "camera", f"{cam}_intrinsic_params.json")) as f:
+            intrinsic_info = json.load(f)["intrinsic"]
+            intrinsic = np.eye(3)
+            intrinsic[0,0] = intrinsic_info["fx"]
+            intrinsic[1,1] = intrinsic_info["fy"]
+            intrinsic[0,2] = intrinsic_info["ppx"]
+            intrinsic[1,2] = intrinsic_info["ppy"]
+        ### 3,3
+        np.save(os.path.join(save_root, f"intrinsic_{cam}.npy"), intrinsic)
 
 
     ### get frames

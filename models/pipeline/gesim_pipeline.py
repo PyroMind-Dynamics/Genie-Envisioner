@@ -12,6 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+GE-Sim(Cosmos2) 推理 Pipeline（多视角 Video-to-World / Video Rollout）
+
+本文件基于 diffusers 的 Cosmos2 Video2World pipeline 改造，核心目标是：
+- 输入：多视角“记忆帧”(memory video) + 文本 prompt + 额外条件(cond_to_concat：轨迹(traj) + 射线(ray) + padding mask 等)
+- 输出：未来一段视频（rollout），可选择输出为 torch / numpy / PIL 等格式
+
+在具身智能 World Model 语境下：
+- 多视角 n_view：同一时刻来自多个相机的观测（例如 head / hand_left / hand_right）
+- 记忆帧 n_prev：历史观测帧，用于条件（模型只“生成未来”，不重建这部分）
+- 未来帧 num_frames：本次要生成的未来帧数量（对应 chunk size）
+- cond_to_concat：与视频 latent 在 channel 维拼接的几何条件（轨迹热力图、射线图等）
+
+张量约定（与仓库其他代码保持一致）：
+- video 输入通常是 (b*v, t, c, h, w) 或 (b*v, c, t, h, w)（具体取决于 preprocess）
+- pipeline 内部会统一到 (b*v, c, t, h, w)
+- VAE latent 一般是 (b*v, z_dim, t_lat, h_lat, w_lat)
+
+注意：
+本文件同时从 `models.pipeline.custom_pipeline` 导入了 `retrieve_timesteps/retrieve_latents`，
+但下方又定义了同名函数（来自 diffusers 示例）。Python 以“后定义覆盖先导入”为准，
+因此实际使用的是本文件内定义的版本。这里保留该结构是为了与上游代码对齐。
+"""
+
 ### This file is modified from https://github.com/huggingface/diffusers/blob/f064b3bf73e479051ed4255d98afad4259a6f012/src/diffusers/pipelines/cosmos/pipeline_cosmos2_video2world.py
 
 
@@ -246,7 +270,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         dtype: Optional[torch.dtype] = None,
     ):
         r"""
-        Encodes the prompt into text encoder hidden states.
+        将 prompt 编码为文本 encoder hidden states（Cosmos2 使用 T5）。
 
         Args:
             prompt (`str` or `List[str]`, *optional*):
@@ -279,6 +303,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
+        # 1) 正向 prompt
         if prompt_embeds is None:
             prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=prompt, max_sequence_length=max_sequence_length, device=device, dtype=dtype
@@ -289,6 +314,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
             prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
 
+        # 2) 负向 prompt（CFG 用）
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
@@ -372,13 +398,13 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
     def infer(
         self,
         image: PipelineImageInput = None,
-        video: List[PipelineImageInput] = None,  # input video is (b v) t c h w (t is ahead of c)
-        cond_to_concat: List[PipelineImageInput] = None,  # (b v) c t h w, could have different t than video t
+        video: List[PipelineImageInput] = None,  # 输入视频：常见形状 (b*v, t, c, h, w)（时间在前）
+        cond_to_concat: List[PipelineImageInput] = None,  # 额外条件：形状 (b*v, c_cond, t_cond, h, w)，t_cond 可与 video 不同
         prompt: Union[str, List[str]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 704,
         width: int = 1280,
-        num_frames: int = 93, # equals chunk size
+        num_frames: int = 93, # 本次生成的未来帧数（chunk size，注意：不包含 memory）
         num_inference_steps: int = 35,
         guidance_scale: float = 7.0,
         fps: int = 16,
@@ -395,15 +421,26 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         sigma_conditioning: float = 0.0001,
-        n_view: int = 3,
-        n_prev: int = 4,
+        n_view: int = 3,   # 视角数（相机数）
+        n_prev: int = 4,   # 记忆帧数（作为条件输入，不生成）
         merge_view_into_width: bool = False,
         postprocess_video: bool = True,
         show_progress: bool = True,
         **kwargs,
     ):
         r"""
-        The call function to the pipeline for generation.
+        GE-Sim rollout 推理入口。
+
+        核心思路：
+        - 只把“记忆帧”编码为 conditioning_latents
+        - 未来帧 latents 从高斯噪声初始化，通过扩散反推逐步去噪
+        - 在 Transformer 输入通道维拼接 cond_to_concat（轨迹/射线等），让模型具备几何约束
+
+        关键形状（简化）：
+        - memory video:            (b*v, c, n_prev, h, w)
+        - future latents(noise):   (b*v, z_dim, t_lat, h_lat, w_lat)
+        - conditioning_latents:    (b*v, z_dim, n_prev, h_lat, w_lat)
+        - cond_to_concat_resized:  (b*v, c_cond, n_prev+t_lat, h_lat, w_lat)
 
         Args:
             image (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, *optional*):
@@ -483,7 +520,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
-        # 1. Check inputs. Raise error if not correct
+        # 1) 参数检查：分辨率必须能被下采样整除等
         self.check_inputs(prompt, height, width, prompt_embeds, callback_on_step_end_tensor_inputs)
 
         self._guidance_scale = guidance_scale
@@ -504,7 +541,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         #                 )
         #     self.safety_checker.to("cpu")
 
-        # 2. Define call parameters
+        # 2) batch_size（这里的 batch 指“文本 prompt 的 batch”，后面会乘上 n_view）
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -512,7 +549,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        # 3. Encode input prompt
+        # 3) 文本编码：得到 prompt_embeds 与 negative_prompt_embeds（CFG）
         assert num_videos_per_prompt == 1  # TODO: only support num_videos_per_prompt=1 for now
         (
             prompt_embeds,
@@ -528,7 +565,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             max_sequence_length=max_sequence_length,
         )
 
-        # 4. Prepare timesteps
+        # 4) 构造扩散时间表（Cosmos 使用 sigma schedule）
         sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
         sigmas = torch.linspace(0, 1, num_inference_steps, dtype=sigmas_dtype)
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, device=device, sigmas=sigmas)
@@ -536,21 +573,23 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             # Replace the last sigma (which is zero) with the minimum sigma value
             self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
 
-        # 5. Prepare latent variables
+        # 5) 预处理视频输入，并准备 future latents（纯噪声初始化）与 conditioning_latents（由 memory 编码）
         vae_dtype = self.vae.dtype
         transformer_dtype = self.transformer.dtype
 
         if image is not None:
             video = self.video_processor.preprocess(image, height, width).unsqueeze(2)
         else:
-            # input video is (b v) t c h w, output is (b v) c t h w
+            # 输入 video 常见是 (b*v, t, c, h, w)，预处理后统一为 (b*v, c, t, h, w)
             video = self.video_processor.preprocess_video(video, height, width)
         video = video.to(device=device, dtype=vae_dtype)
 
         # num_channels_latents = self.transformer.config.in_channels - 1
         num_channels_latents = self.vae.z_dim
+        # 只取前 n_prev 帧作为记忆条件（多出来的帧会被丢弃）
         if video.shape[2] > n_prev:  # pyright: ignore
             video = video[:, :, :n_prev]  # pyright: ignore
+        # prepare_latents：返回 future latents（噪声）、memory latents（conditioning_latents）与 mask/indicator
         latents, conditioning_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask = self.prepare_latents(
             video,  # memory only! (b v) c t h w
             batch_size * n_view,
@@ -572,11 +611,12 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             uncond_mask = uncond_mask.to(transformer_dtype)
             unconditioning_latents = conditioning_latents
 
-        padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)  # ??? looks like it's always 0
+        # padding_mask：Cosmos2 的输入接口需要（这里全 0，相当于不 mask）
+        padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
         sigma_conditioning = torch.tensor(sigma_conditioning, dtype=torch.float32, device=device)
         t_conditioning = sigma_conditioning / (sigma_conditioning + 1)
 
-        # 6. Denoising loop
+        # 6) 去噪循环：每个 timestep 计算 transformer 噪声预测并更新 latents
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
@@ -597,29 +637,35 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                 # timestep = current_t.view(1, 1, 1, 1, 1).expand(
                 #     latents.size(0), -1, latents.size(2), -1, -1
                 # )  # [B, 1, T, 1, 1]
+                # timestep 张量会扩展到 (B, 1, T_total, 1, 1)，其中 T_total=memory_lat + future_lat
                 timestep = current_t.view(1, 1, 1, 1, 1).expand(
                     latents.size(0), -1, latents.size(2)+conditioning_latents.size(2), -1, -1
                 )  # [B, 1, T, 1, 1]
                 # timestep = timestep * 1000  # LTX, timestep ranges from 1 to 1000
 
+                # cond_latent：将 future latents 乘上缩放系数，随后与 memory latents 拼接形成完整时序
                 cond_latent = latents * c_in  # all noise with a scale factor
                 # replace :n_prev frames with clean video latents
                 # cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * cond_latent
-                cond_latent = torch.cat([conditioning_latents, cond_latent], dim=2)  # frame
+                # frame 维拼接：memory 在前，future 在后
+                cond_latent = torch.cat([conditioning_latents, cond_latent], dim=2)
 
                 n_fut = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
+                # 将几何条件 resize 到 latent 空间分辨率与时间长度（memory + future_lat）
                 cond_to_concat = cond_to_concat.to(device=cond_latent.device, dtype=cond_latent.dtype)
                 cond_to_concat_resze = resize_traj_and_ray(cond_to_concat, 
                     mem_size=n_prev, future_size=n_fut,
                     height=cond_latent.shape[-2], width=cond_latent.shape[-1]
                 )
 
-                cond_latent = torch.cat([cond_latent, cond_to_concat_resze], dim=1)  # channel
+                # channel 维拼接：把 traj/ray 等条件与视频 latent 拼到一起送入 transformer
+                cond_latent = torch.cat([cond_latent, cond_to_concat_resze], dim=1)
                 cond_latent = cond_latent.to(transformer_dtype)  # (b v) c t h w
                 cond_timestep = cond_indicator * t_conditioning + (1 - cond_indicator) * timestep
                 cond_timestep = cond_timestep.to(transformer_dtype)
 
+                # transformer 输出噪声预测（这里取 video 分支），并去掉 memory 部分
                 noise_pred = self.transformer(
                     hidden_states=cond_latent,
                     timestep=cond_timestep,
@@ -639,12 +685,14 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                 noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
                 # noise_pred = cond_indicator * conditioning_latents + (1 - cond_indicator) * noise_pred
 
+                # CFG：再跑一次 negative prompt 的预测，做 guidance 合成
                 if self.do_classifier_free_guidance:
                     uncond_latent = latents * c_in
                     # replace :n_prev frames with clean video latents
                     # uncond_latent = uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * uncond_latent
                     uncond_latent = torch.cat([conditioning_latents, uncond_latent], dim=2)  # frame
-                    uncond_latent = torch.cat([uncond_latent, cond_to_concat.to(device=cond_latent.device, dtype=cond_latent.dtype)], dim=1)  # channel
+                    # 这里使用未 resize 的 cond_to_concat（与 cond 分支略不同）；保持原作者实现不改动
+                    uncond_latent = torch.cat([uncond_latent, cond_to_concat.to(device=cond_latent.device, dtype=cond_latent.dtype)], dim=1)
                     uncond_latent = uncond_latent.to(transformer_dtype)
                     uncond_timestep = uncond_indicator * t_conditioning + (1 - uncond_indicator) * timestep
                     uncond_timestep = uncond_timestep.to(transformer_dtype)
@@ -666,6 +714,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
                     # )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
+                # scheduler.step 需要的“velocity/noise”形式
                 noise_pred = (latents - noise_pred) / current_sigma
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
@@ -688,6 +737,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
 
         self._current_timestep = None
 
+        # 7) 解码：将 latents 反标准化并经 VAE decode 得到像素空间视频
         if not output_type == "latent":
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
@@ -718,6 +768,7 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
             #     video = self.video_processor.postprocess_video(video, output_type=output_type)
             #     self.safety_checker.to("cpu")
             # else:
+            # 后处理：输出类型转换、范围裁剪等
             if postprocess_video:
                 video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
@@ -747,6 +798,20 @@ class GeSimCosmos2Pipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        构造扩散所需的初始 latent 与 mask。
+
+        输入：
+        - video: (b*v, c, n_prev, h, w) 的记忆帧（像素空间，已 preprocess 到 [-1,1]）
+
+        输出：
+        - latents:              (b*v, z_dim, t_lat, h_lat, w_lat) 未来段的“纯噪声”初始化 latent
+        - init_latents:         (b*v, z_dim, n_prev, h_lat, w_lat) 由 VAE 编码得到的记忆帧 latent
+        - cond_indicator/mask:  指示哪些时间步是 conditioning（记忆帧）
+
+        说明：
+        Cosmos2 的时间下采样会使 latent 帧数 t_lat = floor((num_frames-1)/temporal_down)+1。
+        """
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
