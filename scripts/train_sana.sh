@@ -2,6 +2,7 @@
 
 # 关闭NCCL_SHM,防止通讯超时中断训练
 export NCCL_SHM_DISABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 script_path=${1}
 echo $script_path

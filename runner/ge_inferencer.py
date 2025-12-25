@@ -35,6 +35,8 @@ from utils.model_utils import load_condition_models, load_latent_models, load_va
 from torch.utils.tensorboard import SummaryWriter
 from utils import init_logging, import_custom_class, save_video
 from utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
+from utils.get_traj_maps import get_traj_maps, simple_radius_gen_func
+from utils.get_ray_maps import get_ray_maps
 
 from data.utils.statistics import StatisticInfo
 
@@ -254,7 +256,62 @@ class Inferencer:
                 else:
                     history_action_state = None
 
-                breakpoint()
+                # GE-Sim 条件（traj + ray）：推理时也保持与训练一致
+                cond_to_concat = None
+                if getattr(self.args, "action_cond_mode", False):
+                    pose_seq = batch.get("actions", None)
+                    intr_bv = batch.get("intrinsics", None)
+                    c2ws_bvt = batch.get("c2ws", None)
+                    if pose_seq is None or intr_bv is None or c2ws_bvt is None:
+                        raise RuntimeError(
+                            "action_cond_mode=True 但 batch 缺少 actions/intrinsics/c2ws。"
+                            "请确保数据集返回这些字段。"
+                        )
+
+                    pose_seq_cpu = pose_seq[:batch_size].detach().cpu()
+                    intr_cpu = intr_bv[:batch_size].detach().cpu()
+                    c2ws_cpu = c2ws_bvt[:batch_size].detach().cpu()
+
+                    latent_height = h // self.SPATIAL_DOWN_RATIO
+                    latent_width = w // self.SPATIAL_DOWN_RATIO
+
+                    cond_per_bv = []
+                    for bi in range(pose_seq_cpu.shape[0]):
+                        pose_i = pose_seq_cpu[bi]
+                        intrinsic_i = intr_cpu[bi]
+                        c2w_i = c2ws_cpu[bi]
+                        w2c_i = torch.linalg.inv(c2w_i)
+
+                        intrinsic_low = intrinsic_i.clone()
+                        intrinsic_low[:, 0, 0] = intrinsic_low[:, 0, 0] * (latent_width / w)
+                        intrinsic_low[:, 0, 2] = intrinsic_low[:, 0, 2] * (latent_width / w)
+                        intrinsic_low[:, 1, 1] = intrinsic_low[:, 1, 1] * (latent_height / h)
+                        intrinsic_low[:, 1, 2] = intrinsic_low[:, 1, 2] * (latent_height / h)
+
+                        trajs = get_traj_maps(
+                            pose_i,
+                            w2c_i,
+                            c2w_i,
+                            intrinsic_low,
+                            sample_size=(latent_height, latent_width),
+                            radius_gen_func=simple_radius_gen_func,
+                        )
+                        trajs = trajs * 2.0 - 1.0
+
+                        v_ = c2w_i.shape[0]
+                        t_ = c2w_i.shape[1]
+                        intrinsic_vt = intrinsic_low.unsqueeze(1).repeat(1, t_, 1, 1).reshape(-1, 3, 3)
+                        c2w_vt = c2w_i.reshape(-1, 4, 4)
+                        rays_o, rays_d = get_ray_maps(intrinsic_vt, c2w_vt, latent_height, latent_width)
+                        rays = torch.cat((rays_o, rays_d), dim=-1)
+                        rays = rays.reshape(v_, t_, latent_height, latent_width, 6).permute(4, 0, 1, 2, 3).contiguous()
+
+                        cond_i = torch.cat((trajs, rays), dim=0)  # (9, v, t_raw, H, W)
+                        cond_i = cond_i.permute(1, 0, 2, 3, 4).contiguous()  # (v, 9, t_raw, H, W)
+                        cond_per_bv.append(cond_i)
+
+                    cond_per_bv = torch.cat(cond_per_bv, dim=0)  # (b*v, 9, t_raw, H, W)
+                    cond_to_concat = cond_per_bv.to(device=self.device, dtype=self.weight_dtype)
 
                 preds = pipe.infer(
                     image=image,
@@ -276,7 +333,8 @@ class Inferencer:
                     history_action_state = history_action_state,
                     pixel_wise_timestep = self.args.pixel_wise_timestep,
                     n_chunk=n_chunk_video,
-                    action_dim=self.args.diffusion_model["config"]["action_in_channels"],
+                    action_dim=self.args.diffusion_model.get("config", {}).get("action_in_channels", 14),
+                    cond_to_concat=cond_to_concat,
                 )[0]
 
                 save_cap = f'Validation_{i_validation}'

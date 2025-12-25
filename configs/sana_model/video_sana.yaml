@@ -1,6 +1,6 @@
 model_name: 'sana_2B_480p_train'
 is_i2v: True
-report_to: None
+report_to: "none"
 tracker_name: sana_2B_480p_trainer
 output_dir: outputs/sana_2B_480p_train   # 训练产出目录（ckpt/日志）
 
@@ -11,8 +11,13 @@ train_data_class: AgiBotWorld              # 训练集类名
 val_data_class_path: data/agibotworld_dataset.py  # 验证集类路径，若同训练集可复用
 val_data_class: AgiBotWorld          # 验证集类名，若同训练集可复用
 
-pretrained_model_name_or_path: /workspace/SANA-Video_2B_480p
-tokenizer_pretrained_model_name_or_path: /workspace/SANA-Video_2B_480p
+# 说明：
+# - 当前仓库的 tokenizer/text_encoder/vae 加载逻辑依赖 diffusers 目录结构（tokenizer/、text_encoder/、vae/ 子目录）。
+# - `/workspace/SANA-Video_2B_480p` 仅提供原仓库 `.pth` transformer 权重与 VAE pth，不包含 diffusers 的 tokenizer/text_encoder 目录。
+# 因此这里继续复用 Cosmos2 的 diffusers 资源来加载 tokenizer/text_encoder/vae，
+# 并在 `diffusion_model.model_path` 指向 SANA 的 `.pth` 作为 backbone 初始化。
+pretrained_model_name_or_path: /workspace/Cosmos-Predict2-2B-Video2World
+tokenizer_pretrained_model_name_or_path: /workspace/Cosmos-Predict2-2B-Video2World
 
 
 ### 
@@ -24,14 +29,14 @@ textenc_class: T5EncoderModel
 vae_class_path: models/sana_models/autoencoder_kl_wan.py
 vae_class: AutoencoderKLWan
 
-diffusion_model_class_path: models/sana_models/transformer_sana.py
+diffusion_model_class_path: models/sana_models/transformer_sana_dit.py
 diffusion_model_class: MultiViewSANATransformer3DModel
 
 diffusion_scheduler_class_path: models/pipeline/gesim_cosmos2_pipeline_utils/scheduling_flow_match_euler_discrete.py
 diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler 
 
-pipeline_class_path: models/pipeline/gesim_pipeline.py
-pipeline_class: GeSimCosmos2Pipeline
+pipeline_class_path: models/pipeline/sana_pipeline.py
+pipeline_class: CustomPipeline
 
 
 # 
@@ -48,7 +53,7 @@ caption_dropout_p: 0.06
 
 # dataloader
 batch_size: 4
-dataloader_num_workers: 1
+dataloader_num_workers: 4
 
 gradient_checkpointing: True
 noise_to_first_frame: 0.1
@@ -84,9 +89,9 @@ flow_mode_scale: 1.29
 # 训练/日志/验证/保存步数
 train_steps: 1000000 # 总步数
 train_epochs: 10000 # 总epoch数
-steps_to_save: 1000 # 每多少步保存一次
+steps_to_save: 500 # 每多少步保存一次
 steps_to_log: 20 # 每多少步记录一次日志
-steps_to_val: 1000 # 每多少步验证一次
+steps_to_val: 500 # 每多少步验证一次
 
 # timeout, seconds
 nccl_timeout: 600
@@ -107,28 +112,21 @@ pixel_wise_timestep: False
 
 
 diffusion_model:
-  model_path: /workspace/Genie-Envisioner/models/ge_sim_cosmos_v0.1.safetensors
+  # SANA backbone (original repo checkpoint)
+  model_path: /workspace/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth
 
   config:
-    in_channels: 26  # 16 (vae) + 3 (traj) + 6 (raymap) + 1 (padding mask)
+    # 与 `/workspace/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth` 的结构对齐：
+    # hidden_dim=2240, num_layers=20, self-attn qkv 合并线性层
+    latent_channels: 16
+    cond_channels: 9   # traj(3) + ray(6)；训练时会在 token channel 维拼接
     out_channels: 16
-    num_attention_heads: 16
-    attention_head_dim: 128
-    num_layers: 28
-    mlp_ratio: 4.0
-    text_embed_dim: 1024
-    adaln_lora_dim: 256
-    max_size: [128, 240, 240]
-    patch_size: [1, 2, 2]
-    rope_scale: [1.0, 3.0, 3.0]
-    concat_padding_mask: true  # TODO: no idea how does this work
-    extra_pos_embed_type: null
-    use_view_embed: true
-    action_expert: false
-    action_in_channels: 7
-    action_num_attention_heads: 16
-    action_attention_head_dim: 32
-    action_rope_dim: 32
+    hidden_dim: 2240
+    num_layers: 20
+    num_heads: 20
+    patch_size: [2, 2]          # 对应 checkpoint 的 x_embedder.proj.weight (..,1,2,2)
+    timestep_embed_dim: 256
+    text_embed_dim: 1024        # 复用 Cosmos 的 T5 d_model=1024，模型内部会投影到 2240
 
 
 data:

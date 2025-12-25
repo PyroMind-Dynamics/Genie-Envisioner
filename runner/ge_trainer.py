@@ -10,6 +10,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pathlib import Path
 from typing import Any, Dict, List
+import inspect
 
 from datetime import datetime, timedelta
 import argparse
@@ -593,6 +594,17 @@ class Trainer:
                     prompt_embeds = self.uncond_prompt_embeds.repeat(batch_size,1,1)*dropout_mask_prompt + \
                                     prompt_embeds*~dropout_mask_prompt
 
+                    # IMPORTANT (SANA / multi-view):
+                    # video latents are flattened as (b*v, ...), so text conditions must match that batch.
+                    # Cosmos2 backbone used to tolerate this internally; SANA cross-attn requires batch-aligned encoder states.
+                    is_sana_backbone = (
+                        "sana" in str(getattr(self.args, "diffusion_model_class", "")).lower()
+                        or "sana" in str(getattr(self.args, "diffusion_model_class_path", "")).lower()
+                    )
+                    if is_sana_backbone:
+                        prompt_embeds = prompt_embeds.repeat_interleave(n_view, dim=0)
+                        prompt_attention_mask = prompt_attention_mask.repeat_interleave(n_view, dim=0)
+
                     # These weighting schemes use a uniform timestep sampling and instead post-weight the loss
                     action_weights = compute_density_for_timestep_sampling(
                         weighting_scheme=self.args.flow_weighting_scheme,
@@ -852,6 +864,7 @@ class Trainer:
 
                         model_save_dir = os.path.join(self.save_folder,f'step_{global_step}')
                         model_to_save.save_pretrained(model_save_dir, safe_serialization=True)
+                        print(f"Saved model to {model_save_dir}")
                         del  model_to_save
                         
             memory_statistics = get_memory_statistics()
@@ -888,10 +901,29 @@ class Trainer:
 
         os.makedirs(model_save_dir,exist_ok=True)
 
-        pipe = self.pipeline_class(
-            self.scheduler, self.vae, self.text_encoder, self.tokenizer,
-            unwrap_model(accelerator, self.diffusion_model) if accelerator is not None else self.diffusion_model
-        )
+        # Build pipeline with kwargs to avoid argument-order mismatches across different pipeline classes
+        # (e.g. Cosmos2 pipeline expects (text_encoder, tokenizer, transformer, vae, scheduler) but SANA expects
+        # (scheduler, vae, text_encoder, tokenizer, transformer)).
+        model_for_pipe = unwrap_model(accelerator, self.diffusion_model) if accelerator is not None else self.diffusion_model
+        components = {
+            "scheduler": self.scheduler,
+            "vae": self.vae,
+            "text_encoder": self.text_encoder,
+            "tokenizer": self.tokenizer,
+            "transformer": model_for_pipe,
+            # aliases for potential different naming conventions
+            "unet": model_for_pipe,
+            "diffusion_model": model_for_pipe,
+            "model": model_for_pipe,
+        }
+        sig = inspect.signature(self.pipeline_class.__init__)
+        kwargs = {}
+        for name, p in sig.parameters.items():
+            if name == "self":
+                continue
+            if name in components:
+                kwargs[name] = components[name]
+        pipe = self.pipeline_class(**kwargs)
 
         if image is None:
             batch = next(iter(self.val_dataloader))
@@ -908,6 +940,10 @@ class Trainer:
         image = image[:batch_size]
 
         image = rearrange(image, 'b c v t h w -> (b v) c t h w')
+        # Ensure video has 3 channels (RGB) for VAE encoding
+        # Some datasets may have 4 channels (RGBA), so we take only the first 3
+        if image.shape[1] > 3:
+            image = image[:, :3, :, :, :]
         num_denois_steps = self.args.num_inference_step
 
         if self.args.return_action and getattr(self.args, "add_state", False):
@@ -915,8 +951,69 @@ class Trainer:
         else:
             history_action_state = None
 
-        preds = pipe.infer(
-            image=image,
+        # -----------------------------
+        # GE-Sim 条件（traj + ray）：验证时也必须与训练一致
+        cond_to_concat = None
+        if getattr(self.args, "action_cond_mode", False):
+            pose_seq = batch.get("actions", None)
+            intr_bv = batch.get("intrinsics", None)
+            c2ws_bvt = batch.get("c2ws", None)
+            if pose_seq is None or intr_bv is None or c2ws_bvt is None:
+                raise RuntimeError(
+                    "action_cond_mode=True 但 batch 缺少 actions/intrinsics/c2ws。"
+                    "请确保使用 AgiBotWorld 并在 __getitem__ 返回这些字段。"
+                )
+
+            # 只取前 batch_size 个样本（与 image/prompt 保持一致）
+            pose_seq_cpu = pose_seq[:batch_size].detach().cpu()
+            intr_cpu = intr_bv[:batch_size].detach().cpu()
+            c2ws_cpu = c2ws_bvt[:batch_size].detach().cpu()
+
+            # latent 分辨率（与训练一致）
+            latent_height = h // self.SPATIAL_DOWN_RATIO
+            latent_width = w // self.SPATIAL_DOWN_RATIO
+
+            cond_per_bv = []
+            for bi in range(pose_seq_cpu.shape[0]):
+                pose_i = pose_seq_cpu[bi]  # (t_raw, dim)
+                intrinsic_i = intr_cpu[bi]  # (v, 3, 3)
+                c2w_i = c2ws_cpu[bi]  # (v, t_raw, 4, 4)
+                w2c_i = torch.linalg.inv(c2w_i)
+
+                intrinsic_low = intrinsic_i.clone()
+                intrinsic_low[:, 0, 0] = intrinsic_low[:, 0, 0] * (latent_width / w)
+                intrinsic_low[:, 0, 2] = intrinsic_low[:, 0, 2] * (latent_width / w)
+                intrinsic_low[:, 1, 1] = intrinsic_low[:, 1, 1] * (latent_height / h)
+                intrinsic_low[:, 1, 2] = intrinsic_low[:, 1, 2] * (latent_height / h)
+
+                trajs = get_traj_maps(
+                    pose_i,
+                    w2c_i,
+                    c2w_i,
+                    intrinsic_low,
+                    sample_size=(latent_height, latent_width),
+                    radius_gen_func=simple_radius_gen_func,
+                )
+                trajs = trajs * 2.0 - 1.0  # -> [-1, 1]
+
+                v_ = c2w_i.shape[0]
+                t_ = c2w_i.shape[1]
+                intrinsic_vt = intrinsic_low.unsqueeze(1).repeat(1, t_, 1, 1).reshape(-1, 3, 3)
+                c2w_vt = c2w_i.reshape(-1, 4, 4)
+                rays_o, rays_d = get_ray_maps(intrinsic_vt, c2w_vt, latent_height, latent_width)  # (vt,H,W,3)
+                rays = torch.cat((rays_o, rays_d), dim=-1)  # (vt,H,W,6)
+                rays = rays.reshape(v_, t_, latent_height, latent_width, 6).permute(4, 0, 1, 2, 3).contiguous()
+
+                cond_i = torch.cat((trajs, rays), dim=0)  # (9, v, t_raw, H, W)
+                cond_i = cond_i.permute(1, 0, 2, 3, 4).contiguous()  # (v, 9, t_raw, H, W)
+                cond_per_bv.append(cond_i)
+
+            cond_per_bv = torch.cat(cond_per_bv, dim=0)  # (b*v, 9, t_raw, H, W)
+            cond_to_concat = cond_per_bv.to(device=accelerator.device, dtype=self.state.weight_dtype)
+
+        # Some pipelines (Cosmos2) expect memory video via `video=...`, while others (SANA custom) use `image=...`.
+        infer_sig = inspect.signature(pipe.infer)
+        infer_kwargs = dict(
             prompt=prompt[:batch_size],
             negative_prompt=negative_prompt,
             num_inference_steps=num_denois_steps,
@@ -928,23 +1025,66 @@ class Trainer:
             n_view=v,
             return_action=self.args.return_action,
             n_prev=self.args.data['train']['n_previous'],
-            chunk=(self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1,
+            chunk=(self.args.data['train']['chunk'] - 1) // self.TEMPORAL_DOWN_RATIO + 1,
             return_video=self.args.return_video,
             noise_seed=42,
             action_chunk=self.args.data['train']['action_chunk'],
-            history_action_state = history_action_state,
-            pixel_wise_timestep = self.args.pixel_wise_timestep,
+            history_action_state=history_action_state,
+            pixel_wise_timestep=self.args.pixel_wise_timestep,
             n_chunk=n_chunk,
-            action_dim=self.args.diffusion_model["config"]["action_in_channels"],
-        )[0]
+            action_dim=self.args.diffusion_model.get("config", {}).get("action_in_channels", 14),
+            cond_to_concat=cond_to_concat,
+        )
+        # If pipeline supports output_type/return_dict, request torch output for easier saving.
+        if "output_type" in infer_sig.parameters:
+            infer_kwargs["output_type"] = "pt"
+        if "return_dict" in infer_sig.parameters:
+            infer_kwargs["return_dict"] = True
+        if "video" in infer_sig.parameters:
+            # Cosmos2 pipeline's preprocess_video expects (b*v, t, c, h, w) format
+            # but image is currently (b*v, c, t, h, w), so we need to permute
+            video_input = rearrange(image, 'bv c t h w -> bv t c h w')
+            infer_kwargs["video"] = video_input
+        else:
+            infer_kwargs["image"] = image
+
+        infer_out = pipe.infer(**infer_kwargs)
+        # unwrap common return styles:
+        # - SANA CustomPipeline (return_dict=False) returns (preds_dict,)
+        # - Cosmos2 GeSimCosmos2Pipeline (return_dict=True) returns CosmosPipelineOutput(frames=...)
+        if isinstance(infer_out, (tuple, list)) and len(infer_out) == 1:
+            infer_out = infer_out[0]
+        preds = infer_out
 
         if cap is None:
             cap = 'Validation'
             save_video(rearrange(gt_video[0].data.cpu(), 'c v t h w -> c t h (v w)', v=n_view), os.path.join(model_save_dir, f'{cap}_gt.mp4'), fps=(self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1)
 
         if self.args.return_video:
-            video = preds['video'].data.cpu()
-            save_video(rearrange(video, '(b v) c t h w -> b c t h (v w)', v=n_view)[0], os.path.join(model_save_dir, f'{cap}.mp4'), fps=(self.args.data['train']['chunk']-1)//self.TEMPORAL_DOWN_RATIO+1)
+            # normalize pipeline output to a torch video tensor in shape (b*v, c, t, h, w)
+            video = None
+            if isinstance(preds, dict):
+                video = preds.get("video", None)
+            if video is None and hasattr(preds, "frames"):
+                video = preds.frames
+            if video is None:
+                raise RuntimeError(f"Unsupported pipeline output type for video: {type(preds)}")
+
+            # Cosmos pipeline with output_type='pt' yields (b*v, t, c, h, w); SANA yields (b*v, c, t, h, w)
+            if isinstance(video, torch.Tensor):
+                if video.ndim == 5 and video.shape[1] != 3 and video.shape[2] == 3:
+                    video = rearrange(video, "bv t c h w -> bv c t h w")
+                # if in [0,1], convert to [-1,1] for save_video
+                if video.min().item() >= 0.0 and video.max().item() <= 1.0:
+                    video = video * 2.0 - 1.0
+                video = video.data.cpu()
+                save_video(
+                    rearrange(video, "(b v) c t h w -> b c t h (v w)", v=n_view)[0],
+                    os.path.join(model_save_dir, f"{cap}.mp4"),
+                    fps=(self.args.data["train"]["chunk"] - 1) // self.TEMPORAL_DOWN_RATIO + 1,
+                )
+            else:
+                raise RuntimeError(f"Pipeline returned non-tensor video frames: {type(video)}")
 
         if to_log:
             self.writer.add_text(f'step_{global_step}/{cap} prompt:', prompt[0], global_step)

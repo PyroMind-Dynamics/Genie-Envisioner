@@ -60,12 +60,88 @@ def load_checkpoints(model, pretrained_ckpt, strict=False, ignore_mismatched_siz
     Load safetensors model state dict file.
     """
 
+    def _extract_state_dict(obj):
+        # Common training checkpoints wrap weights under various keys.
+        if not isinstance(obj, dict):
+            return None
+        for k in ["state_dict", "model", "ema", "params", "weights", "net", "module"]:
+            v = obj.get(k, None)
+            if isinstance(v, dict) and v and all(isinstance(x, torch.Tensor) for x in v.values()):
+                return v
+        # Some checkpoints store {'model': {'state_dict': ...}}
+        for k in ["model", "ema", "net", "module"]:
+            v = obj.get(k, None)
+            if isinstance(v, dict):
+                vv = v.get("state_dict", None)
+                if isinstance(vv, dict) and vv and all(isinstance(x, torch.Tensor) for x in vv.values()):
+                    return vv
+        return None
+
+    def _strip_prefix(sd: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+        return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+    def _score_match(sd: Dict[str, torch.Tensor], model_keys: set) -> int:
+        # count direct key matches
+        return sum(1 for k in sd.keys() if k in model_keys)
+
+    def _normalize_state_dict_keys(sd: Dict[str, torch.Tensor], model) -> Dict[str, torch.Tensor]:
+        """
+        Try to align checkpoint keys to current model's keys by stripping common prefixes.
+        This is especially important for original-repo `.pth` checkpoints (e.g. SANA).
+        """
+        model_keys = set(model.state_dict().keys())
+        if not sd:
+            return sd
+
+        # 1) unwrap DistributedDataParallel prefix
+        if any(k.startswith("module.") for k in sd.keys()):
+            sd = {k[len("module."):]: v for k, v in sd.items()}
+
+        # 2) try common container prefixes. We choose the best match w.r.t model keys.
+        candidates = [sd]
+        prefixes = [
+            "model.",
+            "ema.",
+            "diffusion_model.",
+            "transformer.",
+            "unet.",
+            "net.",
+            "generator.",
+        ]
+        for p in prefixes:
+            if any(k.startswith(p) for k in sd.keys()):
+                candidates.append(_strip_prefix(sd, p))
+
+        # also allow chained stripping like "model.diffusion_model."
+        chained = ["model.diffusion_model.", "model.transformer.", "ema.diffusion_model.", "ema.transformer."]
+        for p in chained:
+            if any(k.startswith(p) for k in sd.keys()):
+                candidates.append(_strip_prefix(sd, p))
+
+        # pick best by match count
+        best = max(candidates, key=lambda x: _score_match(x, model_keys))
+        return best
+
     # In this case we have many shards to load
     if os.path.isdir(pretrained_ckpt):
         state_dict = load_index_file(os.path.join(pretrained_ckpt, "diffusion_pytorch_model.safetensors.index.json"))
-    # in this case we need give the file path
+    # torch checkpoint (.pth/.pt) - common for original repos
+    elif str(pretrained_ckpt).endswith((".pth", ".pt")):
+        obj = torch.load(pretrained_ckpt, map_location="cpu")
+        extracted = _extract_state_dict(obj)
+        if extracted is not None:
+            state_dict = extracted
+        elif isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
+            state_dict = obj
+        else:
+            raise ValueError(f"Unsupported checkpoint object type: {type(obj)} from {pretrained_ckpt}")
     else:
+        # in this case we need give the file path
         state_dict = load_file(pretrained_ckpt)
+
+    # normalize keys (prefix stripping etc.)
+    # if isinstance(state_dict, dict):
+        state_dict = _normalize_state_dict_keys(state_dict, model)
 
     if strict:
         model.load_state_dict(state_dict, strict=True)

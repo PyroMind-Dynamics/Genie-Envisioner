@@ -26,7 +26,6 @@ from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils import BaseOutput
@@ -34,6 +33,7 @@ from diffusers.utils import BaseOutput
 
 from einops import rearrange
 from utils.data_utils import gen_noise_from_condition_frame_latent
+from utils.geometry_utils import resize_traj_and_ray
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -182,9 +182,17 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         text_encoder,
         tokenizer,
         transformer,
-        scheduler_action=FlowMatchEulerDiscreteScheduler(),
+        scheduler_action=None,
     ):
         super().__init__()
+
+        # By default, use the same scheduler class/config for action denoising to keep behavior consistent with video.
+        # (GE-Sim runner does not pass scheduler_action explicitly.)
+        if scheduler_action is None and scheduler is not None:
+            try:
+                scheduler_action = scheduler.__class__(**dict(getattr(scheduler, "config", {})))
+            except Exception:
+                scheduler_action = scheduler
 
         self.register_modules(
             vae=vae,
@@ -596,6 +604,7 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
         history_action_state: torch.Tensor = None,
         pixel_wise_timestep: bool = True,
         n_chunk: int = 1,
+        cond_to_concat: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         r"""
@@ -736,6 +745,23 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)  # b,l,c ?
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
+        # IMPORTANT (GE-Sim / multi-view):
+        # image/video batch is (b*v). For CFG, it becomes (2*b*v). Text conditions must be repeated per view.
+        # (Cosmos2 backbone tolerated this; SANA cross-attn requires batch-aligned encoder states.)
+        if n_view is not None and n_view > 1:
+            expected_bs = batch_size * n_view
+            if self.do_classifier_free_guidance:
+                expected_bs = expected_bs * 2
+            if prompt_embeds.shape[0] != expected_bs:
+                if expected_bs % prompt_embeds.shape[0] != 0:
+                    raise ValueError(
+                        f"prompt_embeds batch {prompt_embeds.shape[0]} cannot be expanded to expected batch {expected_bs} "
+                        f"(batch_size={batch_size}, n_view={n_view}, cfg={self.do_classifier_free_guidance})."
+                    )
+                rep = expected_bs // prompt_embeds.shape[0]
+                prompt_embeds = prompt_embeds.repeat_interleave(rep, dim=0)
+                prompt_attention_mask = prompt_attention_mask.repeat_interleave(rep, dim=0)
+
         if len(image.shape) == 4:  # in this case, a single image act as input
             image = image.unsqueeze(2)
         image = image.to(device=device, dtype=prompt_embeds.dtype)  # out_shape b, c, t, h, w, range(-1,1)
@@ -764,6 +790,36 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
             actions = randn_tensor((batch_size, action_chunk, action_dim), device=device, dtype=prompt_embeds.dtype, generator=action_generator)
         else:
             actions = None
+
+        # prepare traj/ray condition tokens if provided (GE-Sim condition)
+        cond_tokens = None
+        if cond_to_concat is not None:
+            # expected final token shape: (bv, L, C_cond) where L = latent_num_frames*latent_h*latent_w
+            if isinstance(cond_to_concat, torch.Tensor):
+                if cond_to_concat.ndim == 5:
+                    # (bv, c_cond, t_raw, h, w) -> resize to (bv, c_cond, latent_num_frames, latent_h, latent_w)
+                    cond_5d = cond_to_concat
+                    cond_5d = cond_5d.to(device=device, dtype=prompt_embeds.dtype)
+                    cond_5d = resize_traj_and_ray(
+                        cond_5d,
+                        mem_size=n_prev,
+                        future_size=chunk,
+                        height=latent_height,
+                        width=latent_width,
+                    )
+                    cond_tokens = rearrange(cond_5d, "bv c t h w -> bv (t h w) c")
+                elif cond_to_concat.ndim == 3:
+                    cond_tokens = cond_to_concat.to(device=device, dtype=prompt_embeds.dtype)
+                else:
+                    raise ValueError(f"cond_to_concat must be 3D tokens or 5D tensor, got {tuple(cond_to_concat.shape)}")
+            else:
+                raise ValueError("cond_to_concat must be a torch.Tensor")
+
+            if cond_tokens.shape[1] != latent_num_frames * latent_height * latent_width:
+                raise ValueError(
+                    f"cond_to_concat token length {cond_tokens.shape[1]} != latent_num_frames*latent_height*latent_width "
+                    f"({latent_num_frames*latent_height*latent_width})"
+                )
 
 
         # 5. Prepare timesteps
@@ -833,6 +889,14 @@ class CustomPipeline(DiffusionPipeline, FromSingleFileMixin):
                     # (g b v) l c
                     latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents.clone()
                     latent_model_input = latent_model_input.to(prompt_embeds.dtype)
+
+                    # concat GE-Sim traj/ray condition to channel dim (last dim) - keep identical to training behavior
+                    if cond_tokens is not None:
+                        cond_in = cond_tokens
+                        if self.do_classifier_free_guidance:
+                            cond_in = torch.cat([cond_in, cond_in], dim=0)
+                        cond_in = cond_in.to(device=latent_model_input.device, dtype=latent_model_input.dtype)
+                        latent_model_input = torch.cat([latent_model_input, cond_in], dim=-1)
 
                     # TODO: only compute video in the first most noisy timestep
                     compute_video = i == 0 or return_video

@@ -84,9 +84,9 @@ flow_mode_scale: 1.29
 # 训练/日志/验证/保存步数
 train_steps: 1000000 # 总步数
 train_epochs: 10000 # 总epoch数
-steps_to_save: 1000 # 每多少步保存一次
+steps_to_save: 500 # 每多少步保存一次
 steps_to_log: 20 # 每多少步记录一次日志
-steps_to_val: 1000 # 每多少步验证一次
+steps_to_val: 500 # 每多少步验证一次
 
 # timeout, seconds
 nccl_timeout: 600

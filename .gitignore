@@ -175,6 +175,8 @@ logs/
 output/
 *.log
 *.log.*
-gesim_video_gen_examples/
 outputs/
 *.safetensors
+models/.msc
+*.npy
+*.png
